@@ -27,3 +27,25 @@ CATEGORY_PROMPTS = {
 # being trusted outright — the "confidence-gap thresholding" from the
 # pitch, so a marginal call doesn't quietly auto-publish.
 CONFIDENCE_GAP_THRESHOLD = 0.08
+
+# Safety filter, stage 1 — deliberately CLIP-based (zero-shot, reusing
+# the same model already loaded for category scoring) rather than a
+# dedicated NSFW classifier. The earlier design used opennsfw2, which
+# pulls in TensorFlow + Keras as a second full ML framework alongside
+# PyTorch — on a memory-constrained free-tier host, loading two entire
+# frameworks at once caused repeated OOM crashes at startup. This is
+# less accurate than a purpose-trained NSFW model, but it's a real,
+# working tradeoff for a resource-constrained deploy — one model,
+# loaded once, doing both jobs.
+SAFETY_PROMPTS = {
+    "safe": "a normal, appropriate photograph suitable for public viewing",
+    "unsafe": "an explicit, pornographic, graphic, or violent photograph",
+}
+
+# If the "unsafe" prompt's score is at or above this, the photo is
+# rejected before category scoring ever runs. Deliberately stricter
+# than a coin-flip (0.5) — false rejects (a safe photo blocked) just
+# mean the user retakes/reselects a photo; false accepts (something
+# actually unsafe getting through) are the worse failure mode, so this
+# errs toward rejecting more readily.
+SAFETY_REJECT_THRESHOLD = 0.4

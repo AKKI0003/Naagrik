@@ -1,26 +1,32 @@
 """
-Nagrik AI service — the pipeline from the pitch, now three stages:
-  1. Safety filter (opennsfw2)      — runs first, on every upload.
+Nagrik AI service — three stages, all running on ONE model (OpenCLIP)
+loaded ONCE, deliberately:
+  1. Safety filter — zero-shot CLIP comparison against safe/unsafe
+     text prompts (see prompts.py). Originally this stage used
+     opennsfw2, a dedicated NSFW classifier — but opennsfw2 pulls in
+     TensorFlow + Keras as a second full ML framework alongside
+     PyTorch, and loading two entire frameworks simultaneously caused
+     repeated out-of-memory crashes on a free-tier host (visible as an
+     endless restart loop with TensorFlow's init logs repeating, never
+     reaching a clean Python traceback — the process was being
+     SIGKILLed by the host, not failing at the application level).
+     Reusing the already-loaded CLIP model for this instead of a
+     second framework is a deliberate memory-vs-accuracy tradeoff for
+     a resource-constrained deploy, not an oversight.
   2. Relevance + category (OpenCLIP zero-shot) — scores the photo
      against civic categories AND an explicit "not a civic issue"
      bucket, with confidence-gap thresholding for uncertain calls.
   3. Description (BLIP image captioning) — a short, free-text caption
-     of what's actually in the photo ("a pothole in the middle of a
-     paved road"), so a report carries more than a bare category
-     label. Only runs when stage 1 passes and stage 2 didn't land on
-     not_an_issue — no point captioning a photo that's about to be
-     rejected or that isn't a civic issue at all.
+     of what's actually in the photo. Only runs when stage 1 passes
+     and stage 2 didn't land on not_an_issue.
 
 This is a real, runnable implementation (not a mocked response) —
-but it has NOT been run end-to-end in the environment this was written
-in, since that would require downloading multi-hundred-MB model
-weights (torch + open_clip + opennsfw2 + BLIP) with no way to verify
-the result here. The classify/embed endpoints' *logic* (safety-filter
-branching, confidence-gap thresholding, embedding normalization) has
-been separately verified with mocked model weights — see the test
-notes in the repo — but the actual model outputs (real category
-accuracy, real caption quality) still need a real smoke test with the
-true weights before a hackathon demo.
+the classify/embed endpoints' *logic* (safety-filter branching,
+confidence-gap thresholding, embedding normalization) has been
+separately verified with mocked model weights, but the actual model
+outputs (real category accuracy, real caption quality, real safety-
+prompt separation) still need a smoke test with the true weights on a
+real deploy before relying on it for a demo.
 
 Run locally:
     pip install -r requirements.txt
@@ -37,7 +43,6 @@ from typing import Optional
 
 import numpy as np
 import open_clip
-import opennsfw2 as n2
 import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,7 +50,12 @@ from PIL import Image
 from pydantic import BaseModel
 from transformers import BlipForConditionalGeneration, BlipProcessor
 
-from prompts import CATEGORY_PROMPTS, CONFIDENCE_GAP_THRESHOLD
+from prompts import (
+    CATEGORY_PROMPTS,
+    CONFIDENCE_GAP_THRESHOLD,
+    SAFETY_PROMPTS,
+    SAFETY_REJECT_THRESHOLD,
+)
 
 app = FastAPI(title="Nagrik AI Service")
 app.add_middleware(
@@ -66,26 +76,25 @@ _clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
 _clip_model.to(_device).eval()
 _tokenizer = open_clip.get_tokenizer("ViT-B-32")
 
-_category_names = list(CATEGORY_PROMPTS.keys())
-_category_text_tokens = _tokenizer([CATEGORY_PROMPTS[c] for c in _category_names]).to(_device)
-with torch.no_grad():
-    _category_text_features = _clip_model.encode_text(_category_text_tokens)
-    _category_text_features /= _category_text_features.norm(dim=-1, keepdim=True)
+
+def _encode_text_prompts(prompts: dict[str, str]):
+    names = list(prompts.keys())
+    tokens = _tokenizer([prompts[k] for k in names]).to(_device)
+    with torch.no_grad():
+        features = _clip_model.encode_text(tokens)
+        features /= features.norm(dim=-1, keepdim=True)
+    return names, features
+
+
+_safety_names, _safety_text_features = _encode_text_prompts(SAFETY_PROMPTS)
+_category_names, _category_text_features = _encode_text_prompts(CATEGORY_PROMPTS)
 
 # BLIP-base — picked over BLIP-large or a full VLM specifically to stay
 # CPU-runnable: ~450MB, a few seconds per image on CPU, no GPU needed.
-# It captions *what's visually in the photo*, not "what civic category
-# is this" — that's still CLIP's job above. Keeping the two models
-# separate (rather than one big VLM doing both) is deliberate: it's
-# what keeps this whole service small enough for a free-tier instance.
 _blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
 _blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
 _blip_model.to(_device).eval()
 
-# A short, neutral prefix steers BLIP toward describing the *problem*
-# rather than the whole scene ("a street with cars and a pothole" vs
-# "a pothole in the road, partially filled with water") — conditional
-# captioning with a civic-report-flavored prompt, not free captioning.
 _CAPTION_PROMPT = "a photo showing"
 
 
@@ -94,8 +103,6 @@ class ClassificationResult(BaseModel):
     predictedCategory: str
     confidence: float
     needsManualReview: bool
-    # None when safety-rejected or classified as not_an_issue — no
-    # point captioning a photo that's about to be discarded.
     description: Optional[str] = None
 
 
@@ -104,9 +111,6 @@ def _generate_caption(image: Image.Image) -> str:
     with torch.no_grad():
         out = _blip_model.generate(**inputs, max_new_tokens=30)
     caption = _blip_processor.decode(out[0], skip_special_tokens=True)
-    # BLIP echoes the conditioning prompt back at the start of its
-    # output — strip it so the frontend gets a clean standalone
-    # sentence instead of "a photo showing a photo showing a pothole".
     if caption.lower().startswith(_CAPTION_PROMPT.lower()):
         caption = caption[len(_CAPTION_PROMPT):].strip()
     return caption[:1].upper() + caption[1:] if caption else caption
@@ -125,31 +129,33 @@ async def classify(photo: UploadFile = File(...)):
     except Exception:
         raise HTTPException(400, "Could not read image")
 
-    # --- Stage 1: safety filter, runs before anything else ------------
-    nsfw_probability = n2.predict_image(image)
-    if nsfw_probability >= 0.8:
-        return ClassificationResult(
-            passedSafetyFilter=False,
-            predictedCategory="not_an_issue",
-            confidence=0.0,
-            needsManualReview=False,
-            description=None,
-        )
-
-    # --- Stage 2: zero-shot relevance + category scoring ---------------
     image_input = _clip_preprocess(image).unsqueeze(0).to(_device)
     with torch.no_grad():
         image_features = _clip_model.encode_image(image_input)
         image_features /= image_features.norm(dim=-1, keepdim=True)
-        similarities = (100.0 * image_features @ _category_text_features.T).softmax(dim=-1)
-        scores = similarities.cpu().numpy()[0]
+
+        # --- Stage 1: safety filter (CLIP zero-shot, see module docstring) --
+        safety_scores = (100.0 * image_features @ _safety_text_features.T).softmax(dim=-1)
+        safety_scores = safety_scores.cpu().numpy()[0]
+        unsafe_score = float(safety_scores[_safety_names.index("unsafe")])
+        if unsafe_score >= SAFETY_REJECT_THRESHOLD:
+            return ClassificationResult(
+                passedSafetyFilter=False,
+                predictedCategory="not_an_issue",
+                confidence=0.0,
+                needsManualReview=False,
+                description=None,
+            )
+
+        # --- Stage 2: zero-shot relevance + category scoring ---------------
+        category_scores = (100.0 * image_features @ _category_text_features.T).softmax(dim=-1)
+        scores = category_scores.cpu().numpy()[0]
 
     ranked_idx = np.argsort(scores)[::-1]
     top_idx, second_idx = ranked_idx[0], ranked_idx[1]
     top_category = _category_names[top_idx]
     top_score = float(scores[top_idx])
     confidence_gap = float(scores[top_idx] - scores[second_idx])
-
     needs_review = confidence_gap < CONFIDENCE_GAP_THRESHOLD
 
     # --- Stage 3: caption, only when there's a real issue to describe --
@@ -158,9 +164,6 @@ async def classify(photo: UploadFile = File(...)):
         try:
             description = _generate_caption(image)
         except Exception:
-            # A captioning failure shouldn't fail the whole request —
-            # the category/confidence result is still usable without
-            # a description; the frontend treats description as optional.
             description = None
 
     return ClassificationResult(
@@ -191,4 +194,5 @@ async def embed(photo: UploadFile = File(...)):
         features /= features.norm(dim=-1, keepdim=True)
 
     return {"embedding": features.cpu().numpy()[0].tolist()}
+
 
