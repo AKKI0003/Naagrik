@@ -41,6 +41,7 @@ by pointing HttpClassificationService directly at this service's
 import io
 from typing import Optional
 
+import anyio
 import numpy as np
 import open_clip
 import torch
@@ -64,6 +65,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serializes the heavy inference work (CLIP + BLIP forward passes) so
+# at most one request is actually running a model at a time. Without
+# this, two photo uploads landing close together each run full
+# inference simultaneously — on a memory-constrained free-tier
+# instance, that kind of transient spike is exactly what triggers a
+# silent OOM kill (SIGKILL, no Python traceback, looks like a
+# "random" crash with nothing in the logs). This costs latency under
+# concurrent load — one request waits for the other — which is the
+# right tradeoff on a single small instance: a slow response beats a
+# crashed one.
+_inference_lock = anyio.Semaphore(1)
+
+# Caps how large an uploaded photo gets before it's handed to the
+# models. Both CLIP's and BLIP's own preprocessing resize internally
+# (to 224x224 and 384x384 respectively), so this doesn't change model
+# accuracy — it just avoids briefly holding a full-resolution phone
+# photo (a modern phone camera can be 4000x3000+, tens of MB
+# decoded) in memory before that internal resize happens, which adds
+# up when multiple requests are anywhere near each other in time.
+_MAX_IMAGE_DIMENSION = 1024
+
+
+def _load_and_cap_image(raw: bytes) -> Image.Image:
+    try:
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception:
+        raise HTTPException(400, "Could not read image")
+    if max(image.size) > _MAX_IMAGE_DIMENSION:
+        image.thumbnail((_MAX_IMAGE_DIMENSION, _MAX_IMAGE_DIMENSION), Image.LANCZOS)
+    return image
 
 # --- Model loading (once, at startup) ---------------------------------
 # ViT-B-32 is the smallest common OpenCLIP checkpoint — chosen
@@ -124,47 +156,45 @@ def health():
 @app.post("/classify", response_model=ClassificationResult)
 async def classify(photo: UploadFile = File(...)):
     raw = await photo.read()
-    try:
-        image = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception:
-        raise HTTPException(400, "Could not read image")
+    image = _load_and_cap_image(raw)
 
-    image_input = _clip_preprocess(image).unsqueeze(0).to(_device)
-    with torch.no_grad():
-        image_features = _clip_model.encode_image(image_input)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
+    async with _inference_lock:
+        image_input = _clip_preprocess(image).unsqueeze(0).to(_device)
+        with torch.no_grad():
+            image_features = _clip_model.encode_image(image_input)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
 
-        # --- Stage 1: safety filter (CLIP zero-shot, see module docstring) --
-        safety_scores = (100.0 * image_features @ _safety_text_features.T).softmax(dim=-1)
-        safety_scores = safety_scores.cpu().numpy()[0]
-        unsafe_score = float(safety_scores[_safety_names.index("unsafe")])
-        if unsafe_score >= SAFETY_REJECT_THRESHOLD:
-            return ClassificationResult(
-                passedSafetyFilter=False,
-                predictedCategory="not_an_issue",
-                confidence=0.0,
-                needsManualReview=False,
-                description=None,
-            )
+            # --- Stage 1: safety filter (CLIP zero-shot, see module docstring) --
+            safety_scores = (100.0 * image_features @ _safety_text_features.T).softmax(dim=-1)
+            safety_scores = safety_scores.cpu().numpy()[0]
+            unsafe_score = float(safety_scores[_safety_names.index("unsafe")])
+            if unsafe_score >= SAFETY_REJECT_THRESHOLD:
+                return ClassificationResult(
+                    passedSafetyFilter=False,
+                    predictedCategory="not_an_issue",
+                    confidence=0.0,
+                    needsManualReview=False,
+                    description=None,
+                )
 
-        # --- Stage 2: zero-shot relevance + category scoring ---------------
-        category_scores = (100.0 * image_features @ _category_text_features.T).softmax(dim=-1)
-        scores = category_scores.cpu().numpy()[0]
+            # --- Stage 2: zero-shot relevance + category scoring ---------------
+            category_scores = (100.0 * image_features @ _category_text_features.T).softmax(dim=-1)
+            scores = category_scores.cpu().numpy()[0]
 
-    ranked_idx = np.argsort(scores)[::-1]
-    top_idx, second_idx = ranked_idx[0], ranked_idx[1]
-    top_category = _category_names[top_idx]
-    top_score = float(scores[top_idx])
-    confidence_gap = float(scores[top_idx] - scores[second_idx])
-    needs_review = confidence_gap < CONFIDENCE_GAP_THRESHOLD
+        ranked_idx = np.argsort(scores)[::-1]
+        top_idx, second_idx = ranked_idx[0], ranked_idx[1]
+        top_category = _category_names[top_idx]
+        top_score = float(scores[top_idx])
+        confidence_gap = float(scores[top_idx] - scores[second_idx])
+        needs_review = confidence_gap < CONFIDENCE_GAP_THRESHOLD
 
-    # --- Stage 3: caption, only when there's a real issue to describe --
-    description = None
-    if top_category != "not_an_issue":
-        try:
-            description = _generate_caption(image)
-        except Exception:
-            description = None
+        # --- Stage 3: caption, only when there's a real issue to describe --
+        description = None
+        if top_category != "not_an_issue":
+            try:
+                description = _generate_caption(image)
+            except Exception:
+                description = None
 
     return ClassificationResult(
         passedSafetyFilter=True,
@@ -183,15 +213,13 @@ async def embed(photo: UploadFile = File(...)):
     implemented in server/routes/reports.js).
     """
     raw = await photo.read()
-    try:
-        image = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception:
-        raise HTTPException(400, "Could not read image")
+    image = _load_and_cap_image(raw)
 
-    image_input = _clip_preprocess(image).unsqueeze(0).to(_device)
-    with torch.no_grad():
-        features = _clip_model.encode_image(image_input)
-        features /= features.norm(dim=-1, keepdim=True)
+    async with _inference_lock:
+        image_input = _clip_preprocess(image).unsqueeze(0).to(_device)
+        with torch.no_grad():
+            features = _clip_model.encode_image(image_input)
+            features /= features.norm(dim=-1, keepdim=True)
 
     return {"embedding": features.cpu().numpy()[0].tolist()}
 
