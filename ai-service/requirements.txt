@@ -1,0 +1,17 @@
+# Deliberately CPU-friendly choices — this runs on a free Render/Railway
+# instance, not a GPU box. open_clip's smallest ViT-B-32 checkpoint and
+# opennsfw2 both run acceptably on CPU for single-image requests.
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+python-multipart==0.0.17
+pillow==11.0.0
+torch==2.5.1
+open_clip_torch==2.29.0
+opennsfw2==0.14.0
+numpy==2.1.3
+# BLIP captioning (stage 3 — free-text description, not just a
+# category label). transformers pulls this model architecture;
+# sentencepiece/protobuf are BLIP's tokenizer dependencies.
+transformers==4.46.3
+sentencepiece==0.2.0
+protobuf==5.28.3

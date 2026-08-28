@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  scroll-behavior: smooth;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  overscroll-behavior: none;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  /* A very subtle radial glow behind everything — this is what takes
+     the app from "flat dark rectangle" to something with actual depth,
+     without needing any image assets. */
+  background:
+    radial-gradient(1200px 600px at 15% -10%, rgba(77, 217, 232, 0.10), transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, rgba(217, 175, 82, 0.08), transparent 55%),
+    #0A1420;
+  background-attachment: fixed;
+}
+
+/* MapLibre's own control stack needs to stay below our overlay
+   controls (which use z-[1000]/[1100]) — same reason the old Leaflet
+   rule existed, just retargeted at MapLibre's class names. */
+.maplibregl-control-container {
+  z-index: 10;
+}
+
+/* Slimmer, on-theme scrollbars instead of the default chunky OS ones —
+   a small detail, but it's exactly the kind of thing that reads as
+   "designed" instead of "default". */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2E93A6; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: #4DD9E8; }
+
+@keyframes nagrik-pulse-ring {
+  0%   { transform: scale(0.9); opacity: 0.55; }
+  70%  { transform: scale(2.2); opacity: 0; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+.nagrik-pulse-ring {
+  animation: nagrik-pulse-ring 2.2s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+}
+
+@keyframes nagrik-fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.nagrik-fade-in { animation: nagrik-fade-in 0.25s ease-out; }
+
+@keyframes nagrik-skeleton {
+  0%   { background-position: -200px 0; }
+  100% { background-position: calc(200px + 100%) 0; }
+}
+.nagrik-skeleton {
+  background: linear-gradient(90deg, #0D1B2A 25%, #14263a 37%, #0D1B2A 63%);
+  background-size: 400px 100%;
+  animation: nagrik-skeleton 1.4s ease-in-out infinite;
+}
+
+/* Frosted-glass panel treatment used for floating map controls — this
+   is the single change that makes the map controls feel premium
+   instead of flat solid boxes stacked on the tiles. */
+.glass-panel {
+  background: rgba(13, 27, 42, 0.72);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+/* No tile-darkening filter needed anymore — OpenFreeMap's "dark"
+   vector style (openfreemap.org, no API key required) is already a
+   proper near-black basemap, unlike the old Esri raster fallback this
+   hack compensated for. Kept as a harmless no-op class in case
+   anything still references it. */
+.nagrik-dark-tiles {
+  filter: none;
+}
