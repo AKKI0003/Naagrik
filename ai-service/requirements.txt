@@ -1,17 +1,29 @@
 # Deliberately CPU-friendly choices — this runs on a free Render/Railway
 # instance, not a GPU box. open_clip's smallest ViT-B-32 checkpoint runs
 # acceptably on CPU for single-image requests.
+#
+# CRITICAL: this line makes pip prefer PyTorch's own CPU-only wheel
+# index over PyPI's default. Without it, plain `torch==2.5.1` on PyPI
+# resolves to the full CUDA/GPU build, which drags in ~2GB of unused
+# nvidia-*-cu12 driver libraries (cublas, cudnn, cusolver, nccl, etc.)
+# that Railway's host has no GPU to ever use. This is what caused the
+# built image to balloon to 3GB and, far more importantly, is the
+# direct cause of the "Out of memory" crash at container startup —
+# the process was being killed before it could even finish importing,
+# well before any of the actual model-loading code ran.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 fastapi==0.115.5
 uvicorn[standard]==0.32.0
 python-multipart==0.0.17
 pillow==11.0.0
 numpy==2.1.3
 
-torch==2.5.1
+torch==2.5.1+cpu
 # open_clip_torch depends on torchvision — pinning it explicitly to
 # the exact release built against torch 2.5.1 stops pip from having
 # to search torchvision's whole version history for a match.
-torchvision==0.20.1
+torchvision==0.20.1+cpu
 open_clip_torch==2.29.0
 
 # NOTE: opennsfw2 (+ its TensorFlow/Keras dependency) was removed.
