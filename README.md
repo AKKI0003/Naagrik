@@ -1,7 +1,7 @@
 # Nagrik — civic issue reporter (web/PWA build)
 
 Report any public infrastructure problem — not just potholes — on a shared,
-aging-aware public map. Built for HACK-4-CROWN, Track 04: Social Impact.
+aging-aware public map.
 
 This is the **web (React + Leaflet + Node/PostGIS) rebuild** of the project,
 replacing an earlier Flutter version. The reason for the switch: a
