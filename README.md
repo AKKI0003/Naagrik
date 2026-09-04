@@ -25,8 +25,8 @@ Map-based, geospatial citizen-issue reporting platform. Report a problem, drop a
 
 ```
 ┌─────────────────┐      ┌──────────────────────┐      ┌───────────────────────┐
-│  React + Leafle │ ───►│  Node.js API         │ ───► │  PostgreSQL / PostGIS │
-│  (client)       │ ◄───│  (proximity queries) │ ◄─── │  (geospatial store)   │
+│  React + Leafle │ ───► │  Node.js API         │ ───► │  PostgreSQL / PostGIS │
+│  (client)       │ ◄─── │  (proximity queries) │ ◄─── │  (geospatial store)   │
 └─────────────────┘      └──────────────────────┘      └───────────────────────┘
          │
          ▼
